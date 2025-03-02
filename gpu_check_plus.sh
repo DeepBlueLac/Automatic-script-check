@@ -1,89 +1,117 @@
-#!/bin/bash
-# GPU环境全面检测脚本 v6.1 (Ubuntu全版本兼容)
+#!/usr/bin/env bash
+# 深度学习环境极简检测脚本(v6.100)
+# 生成报告：system_report_$(hostname)_$(date +%s).txt
 
-# 初始化安全模式
-set -eo pipefail
-trap 'echo -e "\033[31m错误发生在第$LINENO行\033[0m"; exit 1' ERR
-shopt -s inherit_errexit 2>/dev/null || true
+# 硬件检测增强
+detect_hardware() {
+    # CPU型号检测
+    cpu_info=$(lscpu 2>/dev/null | awk -F': +' '/Model name/ {print $2; exit}' || 
+        grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs)
 
-# 颜色编码方案
-RED='\033[1;31m'; GREEN='\033[1;32m'; YELLOW='\033[1;33m'; BLUE='\033[1;34m'; RESET='\033[0m'
+    # 内存容量检测（兼容旧版本free）
+    mem_total=$(free -h 2>/dev/null | awk '/Mem/{print $2}' || 
+        grep MemTotal /proc/meminfo | awk '{printf "%.1fG", $2/1024/1024}')
 
-# 系统基础信息检测
-get_system_info() {
-  # 兼容旧版lsb_release
-  if [ -f /etc/os-release ]; then
-    OS_NAME=$(source /etc/os-release; echo "$PRETTY_NAME")
-  else
-    OS_NAME=$(uname -o)  
-  fi
-  KERNEL=$(uname -r)
+    # GPU信息检测（同时支持NVIDIA/AMD/集显）
+    if command -v nvidia-smi &>/dev/null; then
+        gpu_info=$(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader | head -1 | xargs)
+    else
+        gpu_info=$(lspci 2>/dev/null | grep -i 'vga\|3d\|display' | head -1 | cut -d: -f3- | xargs)
+    fi
 }
 
-# CUDA环境深度检测
-check_cuda_env() {
-  # NVCC路径检测
-  NVCC_PATH=$(which nvcc 2>/dev/null || {
-    [ -x "/usr/local/cuda/bin/nvcc" ] && echo "/usr/local/cuda/bin/nvcc" ||
-    [ -x "$CONDA_PREFIX/bin/nvcc" ] && echo "$CONDA_PREFIX/bin/nvcc" ||
-    echo "${RED}未检测到NVCC${RESET}"
-  })
+# 环境版本检测增强
+detect_versions() {
+    # CUDA路径检测（优先识别conda环境）
+    if [ -n "$CONDA_PREFIX" ]; then
+        cuda_path="$CONDA_PREFIX"
+        nvcc_path=$(find "$cuda_path" -type f -name nvcc 2>/dev/null | head -1)
+    else
+        nvcc_path=$(which nvcc 2>/dev/null || echo "")
+        cuda_path=$(dirname "$(dirname "$nvcc_path")" 2>/dev/null || echo "")
+    fi
 
-  # 版本一致性验证
-  TORCH_CUDA=$(python3 -c "import torch; print(torch.version.cuda or 'CPU版')" 2>/dev/null || echo "${RED}未安装PyTorch${RESET}")
-  SYS_CUDA=$($NVCC_PATH --version 2>/dev/null | grep release | cut -d' ' -f5 || echo "${RED}未获取到版本${RESET}")
+    # CUDA版本检测多路径
+    cuda_system=$(nvcc --version 2>/dev/null | grep release | sed 's/.*release //' | cut -d, -f1 || 
+        find /usr/local/cuda/version.txt -exec cat {} \; 2>/dev/null | cut -d' ' -f3)
 
-  # cuDNN完整性检查
-  CUDNN_HEADER=$(find /usr{/local,}/cuda/include $CONDA_PREFIX/include -name cudnn_version.h 2>/dev/null | head -1)
-  if [ -n "$CUDNN_HEADER" ]; then
-    CUDNN_VER=$(awk '
-      /CUDNN_MAJOR/ {major=$3}
-      /CUDNN_MINOR/ {minor=$3}
-      /CUDNN_PATCH/ {patch=$3}
-      END {if(major&&minor) printf("%d.%d.%d", major, minor, patch)}' $CUDNN_HEADER)
-  else
-    CUDNN_VER="${RED}未检测到cuDNN${RESET}"
-  fi
-
-  # 计算能力验证
-  COMP_CAP=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | 
-    awk -F. '{print $1$2}' | head -1 || echo "${RED}无法获取${RESET}")
+    # PyTorch CUDA版本检测
+    torch_cuda=$(python3 -c "import torch; print(torch.version.cuda or '未检测到CUDA')" 2>/dev/null || 
+        echo "Python/PyTorch未安装")
 }
 
-# 生成检测报告
+# cuDNN完整性检测
+check_cudnn() {
+    # Conda环境检测
+    if [ -n "$CONDA_PREFIX" ]; then
+        cudnn_version=$(find "$CONDA_PREFIX/include" -name cudnn_version.h 2>/dev/null | 
+            xargs grep CUDNN_MAJOR | awk '{print $3"."$5"."$7}' | sed 's/;//g')
+    fi
+    
+    # 系统路径检测
+    if [ -z "$cudnn_version" ]; then
+        cudnn_version=$(find /usr/include /usr/local/cuda/include -name cudnn_version.h 2>/dev/null | 
+            xargs grep CUDNN_MAJOR 2>/dev/null | awk '{print $3"."$5"."$7}' | sed 's/;//g' | head -1)
+    fi
+
+    [ -z "$cudnn_version" ] && cudnn_version="未检测到"
+}
+
+# 计算能力验证
+check_compute_capability() {
+    compute_cap=$(python3 -c "
+import torch
+if torch.cuda.is_available():
+    prop = torch.cuda.get_device_properties(0)
+    print(f'{prop.major}.{prop.minor}')
+else:
+    print('N/A')
+" 2>/dev/null || echo "检测失败")
+}
+
+# 生成结构化报告
 generate_report() {
-  REPORT_FILE="GPU_Env_Report_$(date +%Y%m%d).log"
-  cat << EOF | tee "$REPORT_FILE"
-
-${BLUE}===== GPU环境深度检测报告 =====${RESET}
-[ 生成时间 ] $(date '+%Y-%m-%d %H:%M:%S')
-[ 系统信息 ] ${OS_NAME} | 内核: ${KERNEL}
-
-${GREEN}── CUDA配置验证 ──${RESET}
-NVCC路径:    ${NVCC_PATH}
-系统CUDA:    ${SYS_CUDA}
-PyTorch CUDA: ${TORCH_CUDA}
-cuDNN版本:   ${CUDNN_VER}
-计算能力:    ${COMP_CAP}
-
-${GREEN}── 环境一致性检测 ──${RESET}
-版本匹配:    $([ "${SYS_CUDA%%-*}" = "${TORCH_CUDA%%-*}" ] && 
-             echo "${GREEN}一致${RESET}" || 
-             echo "${RED}不一致${RESET} (系统:${SYS_CUDA} vs PyTorch:${TORCH_CUDA})")
-
-${GREEN}── 完整性检查 ──${RESET}
-CUDA编译器:  $([ -x "$NVCC_PATH" ] && echo "${GREEN}有效" || echo "${RED}无效")
-cuDNN头文件: ${CUDNN_HEADER:-${RED}未找到}}
-EOF
+    report_file="system_report_$(hostname)_$(date +%s).txt"
+    {
+        echo "深度学习环境检测报告 ($(date '+%Y-%m-%d %H:%M'))"
+        echo "========================================"
+        echo "[硬件配置]"
+        echo "CPU架构: ${cpu_info:-未知}"
+        echo "内存总量: ${mem_total:-未知}"
+        echo "GPU信息: ${gpu_info:-未检测到独立显卡}"
+        echo ""
+        echo "[软件环境]"
+        echo "操作系统: $(lsb_release -ds 2>/dev/null || grep PRETTY_NAME /etc/os-release | cut -d'"' -f2)"
+        echo "内核版本: $(uname -r)"
+        echo ""
+        echo "[CUDA环境]"
+        echo "编译器路径: ${cuda_path:-未检测到}"
+        echo "系统CUDA版本: ${cuda_system:-未安装}"
+        echo "PyTorch CUDA版本: ${torch_cuda}"
+        echo "cuDNN版本: ${cudnn_version}"
+        echo "计算能力: ${compute_cap}"
+        echo ""
+        echo "[Python环境]"
+        python3 -V 2>/dev/null || echo "Python3 未安装"
+        command -v conda >/dev/null && echo "Conda版本: $(conda --version 2>/dev/null | cut -d' ' -f2)"
+        python3 -c "import torch; print(f'PyTorch版本: {torch.__version__}')" 2>/dev/null || echo "PyTorch未安装"
+    } > "$report_file"
+    echo "检测完成 ➜ 查看报告: $report_file"
 }
 
 # 主执行流程
 main() {
-  echo -e "${BLUE}[ 开始环境检测 ]${RESET}"
-  get_system_info
-  check_cuda_env
-  generate_report
-  echo -e "\n${GREEN}检测完成 → 报告已保存到: ${REPORT_FILE}${RESET}"
+    detect_hardware
+    detect_versions
+    check_cudnn
+    check_compute_capability
+    generate_report
 }
 
-main "$@"
+# 安全执行环境
+if [ -n "$BASH_VERSION" ]; then
+    main "$@"
+else
+    echo "请使用bash执行此脚本" >&2
+    exit 1
+fi
