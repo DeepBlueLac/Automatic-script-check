@@ -1,8 +1,8 @@
 # GPU 环境检测脚本使用指南
 
 ## 🚀 快速使用
-包含1：普通版 ubuntu系统、硬件自检脚本
-包含2：Plus版 深度学习环境自检脚本
+##1：gpu_env_check.sh：普通版 ubuntu系统、硬件自检脚本
+##2：gpu_check_plus.sh ：Plus版 深度学习环境自检脚本
 ### 1. 克隆仓库
 ```bash
 git clone https://github.com/DeepBuleLake/Automatic-script-check.git
